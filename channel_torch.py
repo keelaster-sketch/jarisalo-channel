@@ -1,0 +1,240 @@
+# -*- coding: utf-8 -*-
+"""
+Complex SISO multipath with oversampling.
+
+Notation:
+T       - number of CIRs to generate. Positive integer. 
+fD      - max Doppler frequency, Hz. Positive float.
+t_step  - time interval between CIRs, seconds. Positive float.
+spts    - number of channel samples per Ts. Positive float. Ts=32.55 nanoseconds
+l_inp   - number of tx symbols, BPSK or QPSK. Positive integer.
+nsps    - number of samples per transmit symbol. Positive integer.
+L       - number of channel taps. Positive integer.
+"""
+# CIR=Channel Impulse Response
+# SISO=Single-Input Single-Output
+
+import torch
+
+
+def TUx(T=1,fD=3.0,spts=1.0,t_step=1.0, device='cpu'):
+    'Generates 3GPP Typical Urban channel delays and amplitudes.'
+    Ts=1e3/30.72/spts     # multiple of 3gpp basic sampling interval, nanoseconds 
+    
+    #3GPP TR 25.943 version 9.0.0 Release 9, Sec 5.1
+    delay_vec_ns=torch.tensor((0,217,512,514,517,674,882,1230,1287,1311,
+                           1349,1533,1535,1622,1818,1836,1884,1943,2048,2140 ),dtype=torch.float, device=device)  #nanoseconds
+    power_vec_dB=torch.tensor((-5.7,-7.6,-10.1,-10.2,-10.2,-11.5,-13.4,-16.3,-16.9,-17.1,
+                           -17.4,-19.0,-19.0, -19.8,-21.5,-21.6,-22.1,-22.6,-23.5,-24.3),dtype=torch.float, device=device)
+
+    delay_vec_samples=torch.round(delay_vec_ns/Ts).to(torch.int)    # integer delay samples
+    power_vec_lin=10**(power_vec_dB/10)
+    power_vec_lin,delay_vec_samples=squeeze_pdp(power_vec_lin, delay_vec_samples,device=device)
+    L=delay_vec_samples.numel()
+    
+    ch_taps=rayltap(T=T,fD=fD,L=L,device=device)
+    t_pwr=torch.sqrt(power_vec_lin)
+    for l in torch.arange(L,device=device):
+        ch_taps[:,l]*=t_pwr[l]
+    
+    return ch_taps,delay_vec_samples
+
+
+def rayltap(T=1,fD=3.0,L=1,t_step=1.0,device='cpu'):
+    # out - (T,L) complex tensor
+    
+    N=16    # number of sinusoids per channel tap
+    T = int(T)
+    L = int(L)
+    N = int(N)
+    fD = float(fD)
+    t_step = float(t_step)
+
+
+    TWOPI=2*torch.pi
+
+    t_aoa=TWOPI*torch.rand((L,N),device=device)         # angles of arrival matrix, radians
+    t_phase=TWOPI*torch.rand((L,N),device=device)       # random start phase matrix, radians
+ 
+    t_const=TWOPI*fD*torch.cos(t_aoa)*t_step            # constant matrix
+    
+    t_expj=torch.zeros((T,L,N),dtype=torch.cfloat, device=device)
+    t_expj[:,:,:]=t_const
+    t_expj[0,:,:]=t_phase    # set initial phase
+    torch.cumsum(t_expj,dim=0,out=t_expj) 
+    torch.exp(1j*t_expj,out=t_expj)
+    ch_tap=torch.sum(t_expj,dim=2)
+    ch_tap/=torch.sqrt(torch.as_tensor(N))    # each tap has unit average power
+    
+    return ch_tap   #shape=(T,L)
+
+
+
+def squeeze_pdp(power_vec_lin,delay_vec_samples,device='cpu'):
+    'Combine tap powers to channel sampling grid.'
+    power_vec_lin=torch.as_tensor(power_vec_lin,dtype=torch.float,device=device)
+    delay_vec_samples=torch.as_tensor(delay_vec_samples,dtype=torch.int,device=device)
+
+
+    if delay_vec_samples.numel()>1:
+        # sort inputs by delay
+        delay_vec_samples,t_idxs=torch.sort(delay_vec_samples)
+        power_vec_lin=power_vec_lin[t_idxs]
+
+        t_bool=torch.zeros_like(delay_vec_samples,dtype=bool,device=device)   
+        t_diff=torch.diff(delay_vec_samples)      
+        while torch.any(t_diff==0):
+            t_bool*=False    # initialize to False
+            t_idx=torch.argwhere(t_diff == 0)[0]      # index of next zero in diff
+            t_bool[t_idx+1]=True                      # index to combine and discard 
+            power_vec_lin[t_idx]+=power_vec_lin[t_idx+1]    # sum tap powers
+            power_vec_lin = power_vec_lin[t_bool==False] 
+            delay_vec_samples=delay_vec_samples[t_bool==False]
+            t_bool=t_bool[t_bool==False]
+            t_diff=torch.diff(delay_vec_samples)
+        
+    return power_vec_lin,delay_vec_samples
+    
+
+def ch_convolve(ch_in,CIR_matrix,delay_vec,device='cpu'):
+    # TODO: full time-domain convolution
+    return ch_fft(ch_in,CIR_matrix,delay_vec,device)
+
+
+def ch_fft(ch_in, CIR_matrix, delay_vec, device='cpu'):
+    """SISO channel time-domain output (no AWGN)."""
+    ch_in = torch.as_tensor(ch_in, dtype=torch.cfloat, device=device)
+    CIR_matrix = torch.as_tensor(CIR_matrix, dtype=torch.cfloat, device=device)
+    delay_vec = torch.as_tensor(delay_vec, dtype=torch.int, device=device).flatten()  # ensure 1D
+
+    # scalar special cases
+    if CIR_matrix.numel() == 1:
+        return ch_in * CIR_matrix
+
+    if ch_in.ndim == 1:
+        ch_in = ch_in.unsqueeze(0)  # make (1, l_txout)
+    if CIR_matrix.ndim == 1:
+        CIR_matrix = CIR_matrix.unsqueeze(0)  # make (1, n_taps)
+
+    T = CIR_matrix.shape[0]
+    l_txout = ch_in.shape[-1]
+    L = delay_vec.max() - delay_vec.min() + 1
+    n = L + l_txout - 1
+
+    # time domain CIR
+    t_ir = torch.zeros((T, L), dtype=torch.cfloat, device=device)
+    t_ir[:, delay_vec] = CIR_matrix
+
+    # FFT-based convolution, over [-1] dimension
+    Hf = torch.fft.fft(t_ir, n=n)
+    Xf = torch.fft.fft(ch_in, n=n)
+    out = torch.fft.ifft(Xf * Hf)
+    return out
+
+
+
+
+def ch_inp_BPSK(T=1,l_inp=128,nsps=1,device='cpu'):
+    'SISO transmitter output, random BPSK'
+    ' T     - # drops to generate (integer scalar =>1)'
+    ' l_inp - # transmit symbols (integer scalar =>1)'
+    ' nsps  - # samples per symbol (integer scalar =>1)'
+    ' out   - (T,x) real matrix, x depends on nsps'
+    T = int(T)
+    l_inp = int(l_inp)
+    nsps = int(nsps)
+    nsps=max(nsps,1)    # make sure it's integer not less than 1
+
+    inp_bits=torch.randint(low=0,high=2,size=(T,1,l_inp),device=device)
+    inp_syms=2.0*inp_bits-1.0            # BPSK symbol matrix
+    t_inp=torch.zeros(T,1,l_inp*nsps, dtype=torch.float,device=device)
+    t_inp[:,0,::nsps]=inp_syms[:,0,:]   # SISO: dim2 is singleton
+
+    # tx pulse shaping filter
+    if nsps==1: 
+        f_ir=torch.ones((1,1,1),device=device)    # 3D unit scalar for conv1d input
+        t_pad=0
+    else:
+        t_grid=torch.linspace(-3,3,6*nsps+1,device=device)
+        f_ir=torch.sinc(t_grid)    # 1D sinc, hard-coded for now
+        f_ir=torch.reshape( f_ir,(1,1,f_ir.numel()) )     # 3D vector for conv1d
+        t_pad=6*nsps+1
+    
+    # SISO: number of in/out channels=1
+    out=torch.conv1d(t_inp,f_ir,padding=t_pad)  # 3D tensor
+    out.squeeze_()
+
+    return out          # 2D tensor 
+
+# inp_bits=torch.randint(low=0,high=2,size=(T,1,l_inp),device=device)
+def ch_inp_BPSK2(inp_bits,nsps=1,device='cpu'):
+    'SISO transmitter output, BPSK. User-inputted bits'
+    ' inp_bits  - (T,l_inp) tensor. Integer.'
+    ' nsps      - # samples per symbol (integer scalar =>1)'
+    ' out       - (T,x) real tensor, x depends on nsps'
+    # tensorize all inputs to device
+    inp_bits=torch.as_tensor((inp_bits) ,dtype=torch.int, device=device)
+    T=inp_bits.shape[0]          
+    l_inp=inp_bits.shape[1]  
+    nsps = int(nsps)
+    nsps=max(nsps,1)    # make sure it's integer not less than 1
+
+    inp_syms=2.0*inp_bits-1.0            # (T,l_inp)
+#    inp_syms.unsqueeze_(1)               # (T,1,l_inp) 
+    inp_syms=torch.reshape(inp_syms, (T,1,l_inp))
+    t_inp=torch.zeros(T,1,l_inp*nsps, dtype=torch.float,device=device)
+    t_inp[:,0,::nsps]=inp_syms[:,0,:]   # SISO: dim2 is singleton
+
+    # tx pulse shaping filter
+    if nsps==1: 
+        f_ir=torch.ones((1,1,1),device=device)    # 3D unit scalar for conv1d input
+        t_pad=0
+    else:
+        t_grid=torch.linspace(-3,3,6*nsps+1,device=device)
+        f_ir=torch.sinc(t_grid)    # 1D sinc, hard-coded for now
+        f_ir=torch.reshape( f_ir,(1,1,f_ir.numel()) )     # 3D vector for conv1d
+        t_pad=6*nsps+1
+    
+    # SISO: number of in/out channels=1
+    out=torch.conv1d(t_inp,f_ir,padding=t_pad)  # 3D tensor 
+    out.squeeze_(1)
+
+    return out          # 2D tensor 
+
+
+def ch_inp_QPSK(T=1,l_inp=128,nsps=1,device='cpu'):
+    'SISO transmitter output, random QPSK'
+    ' T     - # drops to generate (integer scalar =>1)'
+    ' l_inp - # transmit symbols (integer scalar =>1)'
+    ' nsps  - # samples per symbol (integer scalar =>1)'
+    ' out   - (T,x) complex matrix, x depends on nsps'
+    T = int(T)
+    l_inp = int(l_inp)
+    nsps = int(nsps)
+    nsps=max(nsps,1)    # make sure it's integer not less than 1
+
+    inp_bits=torch.randint(low=0,high=2,size=(T,1,2*l_inp),device=device)
+    inp_syms=torch.zeros((T,1,l_inp),dtype=torch.cfloat,device=device)
+    inp_syms[:,0,:]= (2*inp_bits[:,0,0::2]-1) + 1j*(2*inp_bits[:,0,1::2]-1)
+    t_inp=torch.zeros((T,1,l_inp*nsps),dtype=torch.cfloat,device=device)
+    t_inp[:,0,::nsps]=inp_syms[:,0,:]   # SISO: dim2 is singleton
+
+    # tx pulse shaping filter
+    if nsps==1: 
+        f_ir=torch.ones((1,1,1),dtype=torch.cfloat,device=device)    # 3D unit scalar for conv1d input
+        t_pad=0
+    else:
+        t_grid=torch.linspace(-3,3,6*nsps+1,device=device)
+        f_ir=torch.sinc(t_grid)    # 1D sinc, hard-coded for now
+        f_ir=torch.reshape( f_ir,(1,1,f_ir.numel()) )     # 3D vector for conv1d
+        f_ir=torch.complex(f_ir, torch.zeros_like(f_ir))  # complex for conv1d
+        t_pad=6*nsps+1
+    
+    # 1tx antenna, conv1d number of in/out channels=1
+    out=torch.conv1d(t_inp,f_ir,padding=t_pad)  # 3D tensor 
+    out.squeeze_()
+
+    return out          # 2D tensor 
+
+
+
